@@ -49,6 +49,26 @@
   )
 )
 
+(define-private (create-channel-message 
+  (channel-id (buff 32))
+  (balance-a uint)
+  (balance-b uint)
+  (nonce uint)
+)
+  (concat
+    (concat
+      (concat
+        channel-id
+        (uint-to-buff balance-a)
+      )
+      (uint-to-buff balance-b)
+    )
+    (uint-to-buff nonce)
+  )
+)
+
+
+
 ;; Storage for payment channels
 (define-map payment-channels
   {
@@ -206,6 +226,9 @@
     (asserts! (is-valid-signature signature-a) ERR-INVALID-INPUT)
     (asserts! (is-valid-signature signature-b) ERR-INVALID-INPUT)
     (asserts! (not (is-eq tx-sender participant-b)) ERR-INVALID-INPUT)
+	;; Validate that proposed balances are within acceptable ranges
+	(asserts! (<= balance-a (get total-deposited channel)) ERR-INVALID-INPUT)
+	(asserts! (<= balance-b (get total-deposited channel)) ERR-INVALID-INPUT)
 
     ;; Validate channel is open
     (asserts! (get is-open channel) ERR-CHANNEL-CLOSED)
