@@ -304,7 +304,7 @@
         participant-b: participant-b
       }
       (merge channel {
-        dispute-deadline: (+ block-height u1008),  ;; ~7 days at 10-minute blocks
+        dispute-deadline: (+ stacks-block-height u1008),  ;; ~7 days at 10-minute blocks
         balance-a: proposed-balance-a,
         balance-b: proposed-balance-b
       })
@@ -338,7 +338,7 @@
 
     ;; Ensure dispute period has passed
     (asserts! 
-      (>= block-height (get dispute-deadline channel)) 
+      (>= stacks-block-height (get dispute-deadline channel)) 
       ERR-DISPUTE-PERIOD
     )
 
