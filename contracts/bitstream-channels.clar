@@ -28,6 +28,7 @@
 (define-constant ERR-CHANNEL-CLOSED (err u105))
 (define-constant ERR-DISPUTE-PERIOD (err u106))
 (define-constant ERR-INVALID-INPUT (err u107))
+(define-constant ERR-CAPACITY-EXCEEDED (err u108))
 
 ;; Input validation functions
 (define-private (is-valid-channel-id (channel-id (buff 32)))
@@ -399,6 +400,209 @@
     participant-a: participant-a,
     participant-b: participant-b
   })
+)
+
+;; Enhanced channel funding with multi-sig verification (fixed)
+(define-public (fund-channel-enhanced
+  (channel-id (buff 32))
+  (participant-a principal)
+  (participant-b principal)
+  (additional-funds uint)
+  (signature (buff 65))  ;; Counterparty signature for security
+)
+  (let
+    (
+      ;; Get channel - note: can be called by either participant
+      (channel (unwrap!
+        (map-get? payment-channels {
+          channel-id: channel-id,
+          participant-a: participant-a,
+          participant-b: participant-b
+        })
+        ERR-CHANNEL-NOT-FOUND
+      ))
+      
+      ;; Determine which participant is funding
+      (is-funding-a (is-eq tx-sender participant-a))
+      (is-funding-b (is-eq tx-sender participant-b))
+      
+      ;; Create verification message including nonce for replay protection
+      (message (concat
+        (concat
+          (concat
+            (concat
+              channel-id
+              (uint-to-buff additional-funds)
+            )
+            (if is-funding-a 
+              (uint-to-buff (get balance-a channel))
+              (uint-to-buff (get balance-b channel))
+            )
+          )
+          (uint-to-buff (get nonce channel)) ;; Include current nonce
+        )
+        (if is-funding-a 
+          (uint-to-buff u0)  ;; Flag for participant A funding
+          (uint-to-buff u1)  ;; Flag for participant B funding
+        )
+      ))
+      
+      ;; Counterparty address for signature verification
+      (counterparty (if is-funding-a participant-b participant-a))
+      
+      ;; Calculate new balances safely
+      (new-balance-a (if is-funding-a
+        (+ (get balance-a channel) additional-funds)
+        (get balance-a channel)
+      ))
+      (new-balance-b (if is-funding-b
+        (+ (get balance-b channel) additional-funds)
+        (get balance-b channel)
+      ))
+    )
+    
+    ;; Validate inputs
+    (asserts! (is-valid-channel-id channel-id) ERR-INVALID-INPUT)
+    (asserts! (is-valid-deposit additional-funds) ERR-INVALID-INPUT)
+    (asserts! (or is-funding-a is-funding-b) ERR-NOT-AUTHORIZED)
+    
+    ;; Validate channel is open
+    (asserts! (get is-open channel) ERR-CHANNEL-CLOSED)
+    
+    ;; Optional: Add capacity limit check
+    (asserts! (<= (+ (get total-deposited channel) additional-funds) u1000000000) ERR-CAPACITY-EXCEEDED)
+    
+    ;; Verify counterparty signature (prevents unauthorized top-ups)
+    (asserts! 
+      (verify-signature message signature counterparty) 
+      ERR-INVALID-SIGNATURE
+    )
+    
+    ;; Transfer additional funds from sender
+    (try! (stx-transfer? additional-funds tx-sender (as-contract tx-sender)))
+    
+    ;; Update channel state with new balances
+    (map-set payment-channels 
+      {
+        channel-id: channel-id, 
+        participant-a: participant-a, 
+        participant-b: participant-b
+      }
+      (merge channel {
+        total-deposited: (+ (get total-deposited channel) additional-funds),
+        balance-a: new-balance-a,
+        balance-b: new-balance-b,
+        nonce: (+ (get nonce channel) u1) ;; Increment nonce for security
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Also fix the batch funding helper to handle either participant
+(define-private (check-and-fund-channel
+  (funding {channel-id: (buff 32), participant-a: principal, participant-b: principal, amount: uint, funder: principal})
+  (prior-result (response bool uint))
+)
+  (match prior-result
+    success
+      (begin
+        ;; Verify channel exists and is open
+        (match (map-get? payment-channels {
+          channel-id: (get channel-id funding),
+          participant-a: (get participant-a funding),
+          participant-b: (get participant-b funding)
+        })
+          channel
+            (if (get is-open channel)
+              (let
+                (
+                  (is-funding-a (is-eq (get funder funding) (get participant-a funding)))
+                )
+                (begin
+                  (try! (stx-transfer? (get amount funding) tx-sender (as-contract tx-sender)))
+                  (map-set payment-channels 
+                    {
+                      channel-id: (get channel-id funding), 
+                      participant-a: (get participant-a funding), 
+                      participant-b: (get participant-b funding)
+                    }
+                    (merge channel {
+                      total-deposited: (+ (get total-deposited channel) (get amount funding)),
+                      balance-a: (if is-funding-a
+                        (+ (get balance-a channel) (get amount funding))
+                        (get balance-a channel)
+                      ),
+                      balance-b: (if (not is-funding-a)
+                        (+ (get balance-b channel) (get amount funding))
+                        (get balance-b channel)
+                      )
+                    })
+                  )
+                  (ok true)
+                )
+              )
+              (err ERR-CHANNEL-CLOSED)
+          )
+          (err ERR-CHANNEL-NOT-FOUND)
+      )
+    error
+      (err error)
+  )
+)
+
+;; Channel migration to new contract version
+(define-public (migrate-channel
+  (channel-id (buff 32))
+  (participant-a principal)
+  (participant-b principal)
+  (new-contract principal)
+  (signature-a (buff 65))
+  (signature-b (buff 65))
+)
+  (let
+    (
+      (channel (unwrap! (map-get? payment-channels {
+        channel-id: channel-id,
+        participant-a: participant-a,
+        participant-b: participant-b
+      }) ERR-CHANNEL-NOT-FOUND))
+      
+      (message (concat
+        (concat
+          (concat channel-id (uint-to-buff (get total-deposited channel)))
+          (uint-to-buff (get balance-a channel))
+        )
+        (uint-to-buff (get balance-b channel))
+      ))
+    )
+    
+    (asserts! (get is-open channel) ERR-CHANNEL-CLOSED)
+    (asserts! (verify-signature message signature-a participant-a) ERR-INVALID-SIGNATURE)
+    (asserts! (verify-signature message signature-b participant-b) ERR-INVALID-SIGNATURE)
+    
+    ;; Transfer funds to new contract
+    (try! (as-contract (stx-transfer? (get total-deposited channel) 
+                                      (as-contract tx-sender) 
+                                      new-contract)))
+    
+    ;; Close old channel
+    (map-set payment-channels 
+      {channel-id: channel-id, participant-a: participant-a, participant-b: participant-b}
+      (merge channel {is-open: false, total-deposited: u0})
+    )
+    
+    (ok true)
+  )
+)
+
+;; Helper to sum amounts for batch processing
+(define-private (plus-amounts
+  (funding {channel-id: (buff 32), participant-a: principal, participant-b: principal, amount: uint})
+  (sum uint)
+)
+  (+ sum (get amount funding))
 )
 
 ;; Emergency contract withdrawal by owner (with time lock)
